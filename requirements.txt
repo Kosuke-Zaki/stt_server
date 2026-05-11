@@ -1,0 +1,7 @@
+vosk>=0.3.45
+aiohttp>=3.9.0
+openai>=1.30.0
+sounddevice>=0.4.6
+numpy>=1.24
+pynput>=1.7.6
+websockets>=12.0

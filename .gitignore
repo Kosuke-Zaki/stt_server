@@ -1,0 +1,11 @@
+__pycache__/
+.env
+.venv/
+model/am
+model/conf
+model/graph
+model/ivector
+model/ivector_extractor
+model/rescore
+model/README
+my.wav
