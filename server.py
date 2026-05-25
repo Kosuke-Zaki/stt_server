@@ -18,6 +18,7 @@ Stack-chan は PCM を送らず、JSON のみ（mod.js: assistant 受信・ready
   OPENAI_BASE_URL    任意（互換 API）
   OPENAI_SYSTEM      システムプロンプト
   READY_TIMEOUT_SEC  既定: 120（1 文ごとの ready 待ち上限秒）
+  ACK_GATED_INPUT    1/true で ready 完了までマイク・GPT 新規ターンを抑止
 """
 
 from __future__ import annotations
@@ -39,7 +40,12 @@ from typing import Any
 from aiohttp import web
 from vosk import KaldiRecognizer, Model
 
-from dialog import DialogPipeline, load_barge_in_mode, load_openai_settings
+from dialog import (
+    DialogPipeline,
+    load_ack_gated_input,
+    load_barge_in_mode,
+    load_openai_settings,
+)
 
 LOG = logging.getLogger("stt_stackchan")
 
@@ -118,6 +124,7 @@ class SttServer:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._queue: asyncio.Queue[dict[str, str]] | None = None
         self._on_recognized_text: Callable[[str], None] | None = None
+        self._accept_recognition: Callable[[], bool] | None = None
         self._clients: set[web.WebSocketResponse] = set()
         self._clients_lock = asyncio.Lock()
 
@@ -136,10 +143,27 @@ class SttServer:
         *,
         queue: asyncio.Queue[dict[str, str]] | None = None,
         on_recognized_text: Callable[[str], None] | None = None,
+        accept_recognition: Callable[[], bool] | None = None,
     ) -> None:
         self._loop = loop
         self._queue = queue
         self._on_recognized_text = on_recognized_text
+        self._accept_recognition = accept_recognition
+
+    def reset_recognizer(self) -> None:
+        """ゲート再開時など、溜まった PCM 状態を捨てて次の発話区間から認識する。"""
+        self._recognizer = KaldiRecognizer(self._model, self.sample_rate)
+        self._had_speech = False
+        self._last_voice_t = time.monotonic()
+
+    def _should_forward_recognition(self) -> bool:
+        if self._accept_recognition is not None and not self._accept_recognition():
+            return False
+        return True
+
+    def _drop_recognition(self, text: str, *, reason: str) -> None:
+        LOG.info("skipped (%s): %s", reason, text)
+        self.reset_recognizer()
 
     def toggle_send(self) -> None:
         with self._send_lock:
@@ -185,7 +209,10 @@ class SttServer:
                 ok = self._send_enabled
             LOG.info("recognized: %s", text)
             if not ok:
-                LOG.info("skipped (broadcast paused)")
+                self._drop_recognition(text, reason="broadcast paused")
+                return
+            if not self._should_forward_recognition():
+                self._drop_recognition(text, reason="ACK gate / turn busy")
                 return
             loop = self._loop
             if loop is None:
@@ -219,13 +246,15 @@ class SttServer:
                 ok = self._send_enabled
             LOG.info("recognized (silence %.2fs): %s", self.silence_sec, text)
             if not ok:
-                LOG.info("skipped (broadcast paused)")
-                self._recognizer = KaldiRecognizer(self._model, self.sample_rate)
+                self._drop_recognition(text, reason="broadcast paused")
+                return
+            if not self._should_forward_recognition():
+                self._drop_recognition(text, reason="ACK gate / turn busy")
                 return
 
             loop = self._loop
             if loop is None:
-                self._recognizer = KaldiRecognizer(self._model, self.sample_rate)
+                self.reset_recognizer()
                 return
             if self._on_recognized_text is not None:
                 loop.call_soon_threadsafe(self._on_recognized_text, text)
@@ -233,8 +262,7 @@ class SttServer:
                 loop.call_soon_threadsafe(
                     self._queue.put_nowait, {"role": "user", "message": text}
                 )
-            # 次の発話のために recognizer をリセット
-            self._recognizer = KaldiRecognizer(self._model, self.sample_rate)
+            self.reset_recognizer()
             return
 
     def _mic_thread_main(self) -> None:
@@ -470,6 +498,7 @@ async def main_async(args: argparse.Namespace) -> None:
         ready_timeout = float(
             os.environ.get("READY_TIMEOUT_SEC", str(args.ready_timeout))
         )
+        ack_gated = args.ack_gated or load_ack_gated_input()
         dialog = DialogPipeline(
             app=app,
             api_key=api_key,
@@ -478,6 +507,7 @@ async def main_async(args: argparse.Namespace) -> None:
             base_url=base_url,
             ready_timeout=ready_timeout,
             barge_in_mode=load_barge_in_mode(),
+            ack_gated_input=ack_gated,
         )
         app["dialog"] = dialog
         srv.set_recognition_sink(
@@ -485,12 +515,19 @@ async def main_async(args: argparse.Namespace) -> None:
             on_recognized_text=lambda t, d=dialog: d.enqueue_user_text_threadsafe(
                 loop, t
             ),
+            accept_recognition=dialog.is_accepting_input,
         )
         pump = asyncio.create_task(dialog.run_forever())
-        LOG.info(
-            "モード: STT → GPT (%s) → assistant 分割送信 → ready ACK",
-            openai_model,
-        )
+        if ack_gated:
+            LOG.info(
+                "モード: STT → GPT (%s) → assistant → ready ACK → 次の発話受付",
+                openai_model,
+            )
+        else:
+            LOG.info(
+                "モード: STT → GPT (%s) → assistant 分割送信 → ready ACK",
+                openai_model,
+            )
 
     app.router.add_get("/", _websocket_handler)
     app.router.add_post("/message", _post_message)
@@ -586,6 +623,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=120.0,
         help="各 assistant 文の後の ready 待ち秒（既定: 120 / READY_TIMEOUT_SEC）",
+    )
+    p.add_argument(
+        "--ack-gated",
+        action="store_true",
+        help=(
+            "Stack-chan の ready が全チャンク分揃うまでマイク認識・新規 GPT ターンを抑止 "
+            "（環境変数 ACK_GATED_INPUT=1 でも有効）"
+        ),
     )
     p.add_argument("-v", "--verbose", action="store_true")
     return p

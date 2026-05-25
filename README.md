@@ -1,5 +1,7 @@
 # Stack-chan 向け Python VOSK STT + 対話パイプライン（PC マイク版）
 
+リポジトリ直下の **[クイックスタート・前提条件](../README.md)** もあわせて参照してください。
+
 PC で **マイク → VOSK（発話区切り）→（既定）OpenAI → 応答文を句読点で分割**し、**WebSocket で Stack-chan に `role: assistant` を順送り**します。Stack-chan は **GPT を実行せず**、`robot.say` で **端末側 TTS** し、終わったら **`{ "type": "ready" }`** を PC に返します（`mod.js` 想定）。
 
 ```text
@@ -9,6 +11,11 @@ PC マイク → VOSK → ユーザ文
   → 各チャンクを {"role":"assistant","message":"..."} で broadcast
   → Stack-chan: say() → {type:ready} を送信
   → PC: 次のチャンクまで待機（ACK）
+
+[--ack-gated 推奨]
+PC マイク → VOSK で 1 発話区間確定 → GPT → assistant 全チャンク + ready 完了
+  → その後だけ次のマイク入力・GPT ターンを受け付ける
+  （処理中に拾った認識は破棄し recognizer をリセット）
 
 [--stt-only]
 PC マイク → VOSK → {"role":"user","message":"..."} を broadcast（従来の STT のみ）
@@ -25,6 +32,8 @@ PC マイク → VOSK → {"role":"user","message":"..."} を broadcast（従来
 - PC → Stack-chan: `{ "role": "assistant", "message": "..." }`（GPT モード）または `role: user`（`--stt-only`）
 
 ## セットアップ
+
+`.env.example` を `.env` にコピーして値を書いても、**`server.py` は `.env` を自動では読みません**（変数はシェルや IDE の実行設定で渡してください）。
 
 ```powershell
 cd stt_server_stackchan
@@ -44,6 +53,7 @@ python -m pip install -r requirements.txt
 | `OPENAI_BASE_URL` | 任意（互換 API） |
 | `OPENAI_SYSTEM` | システムプロンプト（未設定時はスタックちゃん向け短文） |
 | `READY_TIMEOUT_SEC` | 1 文ごとの `ready` 待ち秒（既定 `120`） |
+| `ACK_GATED_INPUT` | `1` / `true` でターン制（`--ack-gated` と同じ）。ready 完了までマイク・新規ユーザ文を抑止 |
 | `BARGE_IN_MODE` | 発話中のユーザ割り込み（`buffer` / `continue` / **`discard`** / `regenerate` / `pause_resume`、既定 `buffer`） |
 | `SILENCE_SEC` | 無音が続いたら強制確定する秒数（既定 `2.0`） |
 | `VAD_RMS` | 無音判定の RMS 閾値（既定 `500`） |
@@ -60,6 +70,16 @@ python -m pip install -r requirements.txt
 set OPENAI_API_KEY=sk-...
 python server.py -v
 ```
+
+**ターン制（Stack-chan の ready 後だけ次の発話を受け付ける・推奨）**
+
+```powershell
+set OPENAI_API_KEY=sk-...
+python server.py --ack-gated -v
+# または set ACK_GATED_INPUT=1
+```
+
+`--ack-gated` 時は、GPT 応答の分割送信と各チャンクの `ready` がすべて終わるまで、マイク認識結果はキューに入れず破棄します（ログ: `skipped (ACK gate / turn busy)`）。発話区間の切り出しは従来どおり VOSK + `SILENCE_SEC` / `VAD_RMS` です。
 
 **STT のみ（simple-stt-server 相当）**
 
@@ -97,6 +117,7 @@ curl -s -X POST http://127.0.0.1:8088/message -H "Content-Type: application/json
 | `OPENAI_API_KEY が未設定` | キーを設定するか `--stt-only` |
 | `ready が … 秒以内に来ません` | Stack-chan 未接続・`mod.js` 未送信・`chatting` で捨てられていないか確認 |
 | `recognized` は出るが `listen_ws` に何も来ない | Space で **pause** 中。resume する |
+| 連続で GPT が走る | `--ack-gated` を付ける。処理中の `recognized` は意図的に無視される |
 | ポート使用中 | 他プロセスを止めるか `STT_PORT` を変更 |
 
 ## ライセンス

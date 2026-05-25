@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import re
+import threading
 from typing import Any
 
 from aiohttp import web
@@ -61,6 +62,7 @@ class DialogPipeline:
         base_url: str | None,
         ready_timeout: float,
         barge_in_mode: str,
+        ack_gated_input: bool = False,
     ) -> None:
         self._app = app
         self._api_key = api_key
@@ -69,6 +71,7 @@ class DialogPipeline:
         self._base_url = base_url
         self._ready_timeout = ready_timeout
         self._barge_in_mode = barge_in_mode.strip().lower()
+        self._ack_gated_input = ack_gated_input
         self._history: list[dict[str, str]] = []
         self._ready = asyncio.Event()
         self._lock = asyncio.Lock()
@@ -78,14 +81,45 @@ class DialogPipeline:
         self._barge_in_buffer: list[str] = []
         # speaking 中に「残りチャンク送信を止める」要求（mode により意味が違う）
         self._abort_speaking = False
+        # ACK ゲート: 1 ターン（GPT + assistant 全チャンクの ready 完了）までマイク入力を受け付けない
+        self._accepting_input = threading.Event()
+        self._accepting_input.set()
+        self._turn_depth = 0
 
     def notify_ready(self) -> None:
         self._ready.set()
+
+    def is_accepting_input(self) -> bool:
+        """マイクスレッドから参照可。True のときだけ認識結果を受け付ける。"""
+        return self._accepting_input.is_set()
+
+    def _enter_turn(self) -> None:
+        self._turn_depth += 1
+        if self._ack_gated_input and self._turn_depth == 1:
+            self._accepting_input.clear()
+            LOG.debug("ACK ゲート: 音声入力・ユーザ文キューを停止")
+
+    def _leave_turn(self) -> None:
+        if self._turn_depth <= 0:
+            return
+        self._turn_depth -= 1
+        if self._ack_gated_input and self._turn_depth == 0:
+            self._accepting_input.set()
+            srv = self._app.get("stt")
+            if srv is not None:
+                srv.reset_recognizer()
+            LOG.debug("ACK ゲート: 音声入力受付を再開")
 
     def enqueue_user_text(self, text: str) -> None:
         """イベントループ上から呼ぶ。"""
         t = text.strip()
         if len(t) <= 1:
+            return
+        if self._ack_gated_input and not self._accepting_input.is_set():
+            LOG.info(
+                "ACK ゲート: ターン処理中のため無視: %s",
+                t[:60] + ("…" if len(t) > 60 else ""),
+            )
             return
         if self._speaking:
             if self._barge_in_mode == "discard":
@@ -95,6 +129,8 @@ class DialogPipeline:
             if self._barge_in_mode in ("regenerate", "pause_resume"):
                 self._abort_speaking = True
             return
+        if self._ack_gated_input:
+            self._accepting_input.clear()
         self._user_queue.put_nowait(t)
 
     def enqueue_user_text_threadsafe(
@@ -123,6 +159,13 @@ class DialogPipeline:
             return sum(1 for w in srv._clients if not w.closed)
 
     async def _run_one_user_turn(self, user_text: str) -> None:
+        self._enter_turn()
+        try:
+            await self._run_one_user_turn_body(user_text)
+        finally:
+            self._leave_turn()
+
+    async def _run_one_user_turn_body(self, user_text: str) -> None:
         messages: list[dict[str, str]] = [
             {"role": "system", "content": self._system},
             *self._history[-20:],
@@ -247,6 +290,16 @@ def load_openai_settings() -> tuple[str | None, str, str | None, str]:
     base = os.environ.get("OPENAI_BASE_URL", "").strip() or None
     system = os.environ.get("OPENAI_SYSTEM", DEFAULT_SYSTEM).strip()
     return key, model, base, system
+
+
+def load_ack_gated_input() -> bool:
+    """
+    True のとき、Stack-chan が全 assistant チャンクを読み上げ ready を返し終えるまで
+    マイク認識結果と新規ユーザ文を受け付けない（1 発話区間 → 1 GPT ターン）。
+    環境変数 ACK_GATED_INPUT: 1 / true / yes / on で有効。
+    """
+    raw = os.environ.get("ACK_GATED_INPUT", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 def load_barge_in_mode() -> str:
