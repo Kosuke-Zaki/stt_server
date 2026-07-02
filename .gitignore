@@ -26,15 +26,15 @@ __pycache__/
 secrets/
 credentials/
 
+# logs
+*.log
+logs/
+
 # build outputs
 dist/
 build/
 .next/
 out/
-
-# logs
-*.log
-logs/
 
 # OS / editor
 .DS_Store
