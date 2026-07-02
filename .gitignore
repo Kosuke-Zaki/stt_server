@@ -9,3 +9,39 @@ model/ivector_extractor
 model/rescore
 model/README
 my.wav
+
+
+# dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+
+# env / secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+secrets/
+credentials/
+
+# build outputs
+dist/
+build/
+.next/
+out/
+
+# logs
+*.log
+logs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# generated outputs
+generated/
+outputs/
